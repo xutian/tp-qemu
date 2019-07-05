@@ -65,21 +65,6 @@ def block_dirty_bitmap_add(vm, bitmap_params):
     )
     vm.monitor.block_dirty_bitmap_add(**kargs)
 
-
-def get_bitmap_by_name(vm, device, bitmap):
-    """
-    Get device bitmap info by bitmap name
-
-    :param device: device name
-    :param bitmap: bitmap name
-    :return: bitmap info dict or None if bitmap is not exists
-    """
-    for bitmap in get_bitmaps_in_device(vm, device):
-        if bitmap["name"] == bitmap:
-            return bitmap
-    return None
-
-
 @fail_on
 def debug_block_dirty_bitmap_sha256(vm, device, bitmap):
     """
@@ -116,6 +101,18 @@ def block_dirty_bitmap_merge(vm, device, bitmaps, target):
         actions.append({"type": cmd, "data": data})
     return vm.monitor.transalation(actions)
 
+def get_bitmap_by_name(vm, device, bitmap):
+    """
+    Get device bitmap info by bitmap name
+
+    :param device: device name
+    :param bitmap: bitmap name
+    :return: bitmap info dict or None if bitmap is not exists
+    """
+    for bitmap in get_bitmaps_in_device(vm, device):
+        if bitmap["name"] == bitmap:
+            return bitmap
+    return None
 
 def get_bitmaps_in_device(vm, device):
     """Get bitmap list on given device"""

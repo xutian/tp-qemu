@@ -152,12 +152,13 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
 
     def do_incremental_backup_with_bitmap4(self, base_node, base_image):
         """Do incremental backup with bitmap4"""
-        bitmap, sync = "bitmap_4", "incremental"
-        node_name, image_file = self.create_target_block_device(
-            base_node, base_image)
-        options = {"device": self.device, "target": node_name,
-                   "sync": sync, "bitmap": bitmap}
-        self.vm.monitor.blockdev_backup(**options)
+        fmt = self.params.object_params(self.tag).["image_format"]
+        backing = {"backing": base_node, "backing-file": base_image, "backing-fmt": fmt}
+        image = {"filename": self.params["incremental_backup_filename"],
+                 "driver": self.params["incremental_backup_format"],
+                 "size": self.get_target_image_size()}
+        target, image = job_utils.create_target_device(node, **backing, **image)
+        job_utils.incremental_backup(self.vm, self.device, target, "bitmap_4")
         return node_name, image_file
 
     def clean(self):
