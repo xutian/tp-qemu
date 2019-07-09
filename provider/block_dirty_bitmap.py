@@ -9,8 +9,7 @@ from avocado import fail_on
 
 from virttest import data_dir
 from virttest import storage
-
-from . import job_utils
+from virttest import utils_misc
 
 
 def parse_params(vm, params):
@@ -65,6 +64,7 @@ def block_dirty_bitmap_add(vm, bitmap_params):
     )
     vm.monitor.block_dirty_bitmap_add(**kargs)
 
+
 @fail_on
 def debug_block_dirty_bitmap_sha256(vm, device, bitmap):
     """
@@ -74,7 +74,7 @@ def debug_block_dirty_bitmap_sha256(vm, device, bitmap):
     :param bitmap: bitmap name
     :return: sha256 string or None if bitmap is not exists
     """
-    func = job_utils.get_monitor_function(vm)
+    func = utils_misc.get_monitor_function(vm)
     return func(device, bitmap).get("sha256")
 
 
@@ -87,10 +87,10 @@ def block_dirty_bitmap_merge(vm, device, bitmaps, target):
     :param bitmaps: source bitmaps
     :param target: target bitmap name
     """
-    func = job_utils.get_monitor_function(vm)
+    func = utils_misc.get_monitor_function(vm)
     cmd = func.__name__.replace("_", "-")
     logging.debug("Merge %s into %s" % (bitmaps, target))
-    if not cmd.startswith(job_utils.prefix):
+    if not cmd.startswith("x-"):
         return func(device, bitmaps, target)
     # handle 'x-block-dirty-bitmap-merge' command
     if len(bitmaps) == 1:
@@ -100,6 +100,7 @@ def block_dirty_bitmap_merge(vm, device, bitmaps, target):
         data = {"node": device, "src_bitmap": bitmap, "dst_bitmap": target}
         actions.append({"type": cmd, "data": data})
     return vm.monitor.transalation(actions)
+
 
 def get_bitmap_by_name(vm, device, bitmap):
     """
@@ -114,6 +115,7 @@ def get_bitmap_by_name(vm, device, bitmap):
             return bitmap
     return None
 
+
 def get_bitmaps_in_device(vm, device):
     """Get bitmap list on given device"""
     out = vm.monitor.cmd("query-block")
@@ -122,7 +124,7 @@ def get_bitmaps_in_device(vm, device):
 
 @fail_on
 def block_dirty_bitmap_clear(vm, device, name):
-    job_utils.get_monitor_function(vm)(device, name)
+    utils_misc.get_monitor_function(vm)(device, name)
     time.sleep(0.3)
     message = "Count of '%s' in device '%s' not equal '0' after clear it" % (
         device, name)
@@ -144,7 +146,7 @@ def block_dirty_bitmap_remove(vm, device, name):
     """
     Remove bitmaps on the device one by one
     """
-    job_utils.get_monitor_function(vm)(device, name)
+    utils_misc.get_monitor_function(vm)(device, name)
     time.sleep(0.3)
     bitmap = get_bitmap_by_name(vm, device, name)
     message = "'%s' in device '%s' still exists after remove it" % (
@@ -159,3 +161,26 @@ def remove_all_bitmaps_in_device(vm, device):
     """
     func = partial(block_dirty_bitmap_remove, vm, device)
     return map(func, get_bitmaps_in_device(vm, device))
+
+
+def query_block_dirty_bitmap_by_name(vm, node, name):
+    for item in query_block_dirty_bitmap(vm, node):
+        if item.get("name") == name:
+            return item
+    return None
+
+
+def query_block_dirty_bitmap(vm, node):
+    """wrapper for vm.monitor.query_block_dirty_bitmap()"""
+    func = utils_misc.get_monitor_function(vm)
+    return func(node)
+
+
+@fail_on
+def block_dirty_bitmap_disable(vm, node, name):
+    """Disable block dirty bitmap"""
+    func = utils_misc.get_monitor_function(vm)
+    func(node, name)
+    bitmap = query_block_dirty_bitmap_by_name(vm, node, name)
+    assert bitmap.get(
+        "disabled"), "block dirty bitmap '%s' is not disabled" % name

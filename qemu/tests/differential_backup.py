@@ -1,5 +1,6 @@
 import time
 import logging
+from functools import partial
 
 from virttest import error_context
 from virttest import utils_numeric
@@ -7,6 +8,7 @@ from virttest import storage
 from virttest import utils_misc
 from qemu.tests import live_backup_base
 from provider import block_dirty_bitmap
+from provider import backup_utils 
 from provider import job_utils
 
 
@@ -17,31 +19,25 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
         self.device = "drive_%s" % tag
 
     def generate_backup_params(self):
-        """
-        Generate params from source image params for target image
-        :return: dict contain params for create target image
-        """
-        parmas = self.params.object_params(self.tag)
-        params['size'] = self.get_target_image_size()
-        return params
+        """generate target image params"""
+        pass
 
     def init_data_disk(self):
         """Initialize the data disk"""
         session = self.get_session()
-        for param in ["format_disk_cmd", "mount_disk_cmd"]:
-            if self.params.get(param):
-                cmd = self.params[param]
-                session.cmd(cmd)
+        for cmd in ["format_disk_cmd", "mount_disk_cmd"]:
+            if self.params.get(cmd):
+                session.cmd(self.params[cmd])
                 time.sleep(0.5)
         session.close()
 
-    def get_target_image_size(self):
+    def get_target_image_size(self, tag):
         """
         Get target image size align with 512
 
         :return: image size in Bytes
         """
-        params = self.params.object_params(self.tag) 
+        params = self.params.object_params(tag)
         image_size = utils_numeric.normalize_data_size(
             params["image_size"], 'B', 1024)
         return utils_numeric.align_value(image_size, 512)
@@ -54,7 +50,8 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
         :return: record counts
         :rtype: int
         """
-        bitmap = block_dirty_bitmap.get_bitmap_by_name(name)
+        bitmap = block_dirty_bitmap.get_bitmap_by_name(
+            self.vm, self.device, name)
         return bitmap["count"] if bitmap else -1
 
     def get_sha256_of_bitmap(self, name):
@@ -67,35 +64,31 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
         return block_dirty_bitmap.debug_block_dirty_bitmap_sha256(**kwargs)
 
     def _make_bitmap_transaction_action(
-            self, action="add", index=1, **extra_options):
+            self, operator="add", index=1, extra_options=None):
         bitmap = "bitmap_%d" % index
-        action_type = "block-dirty-bitmap-%s" % action
-        action_data = {"node": self.device, "name": bitmap}
-        action_data.update(extra_options)
-        logging.debug("%s bitmap %s" % (action.capitalize, bitmap))
-        return job_utils.make_transaction_action(action_type, action_data)
+        action = "block-dirty-bitmap-%s" % operator
+        data = {"node": self.device, "name": bitmap}
+        if isinstance(extra_options, dict):
+            data.update(extra_options)
+        logging.debug("%s bitmap %s" % (operator.capitalize, bitmap))
+        return backup_utils.make_transaction_action(action, data)
 
     def _bitmap_batch_operate_by_transaction(self, action, bitmap_index_list):
         bitmap_lists = ",".join(
             map(lambda x: "bitmap_%d" % x, bitmap_index_list))
         logging.info("%s %s in a transaction" %
                      (action.capitalize(), bitmap_lists))
-        actions = map(lambda x: self._make_bitmap_transaction_action(
-            action=action, index=x), bitmap_index_list)
+        func = partial(self._make_bitmap_transaction_action, action)
+        actions = map(func, bitmap_index_list)
         return self.vm.monitor.transaction(actions)
 
-    def do_full_backup(self):
+    def do_full_backup(self, tag):
         """Do full backup"""
-        node_name, file_name = self.create_target_block_device()
-        action_data = {
-            "device": self.device,
-            "target": node_name,
-            "sync": "full"}
-        actions = [job_utils.make_transaction_action(
-            "blockdev-backup", action_data)]
-        actions += self._bitmap_batch_operate_by_transaction("add", [1, 2])
-        self.vm.monitor.transaction(actions)
-        return node_name, file_name
+        backing_info = dict()
+        node_name = self.create_target_block_device(backing_info, tag)
+        backup_utils.full_backup(self.vm, self.device, node_name)
+        self._bitmap_batch_operate_by_transaction("add", [1, 2])
+        return node_name
 
     def _track_file_with_bitmap(self, filename, action_items):
         """
@@ -108,20 +101,66 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
         self.create_file(filename)
         actions = []
         for item in action_items:
-            operator = item["action"]
-            bitmap = item["index"]
-            actions += [job_utils.make_transaction_action(operator, bitmap)]
+            action = item["action"]
+            index = item["index"]
+            actions += [self._make_bitmap_transaction_action(action, index)]
         self.vm.monitor.transaction(actions)
 
-    def create_target_block_device(self, **backing_info):
+    def create_target_block_device(self, backing_info, tag):
         """Create target backup device by qemu"""
-        driver = self.params.get("target_driver", "file")
-        job_utils.blockdev_create(driver, **self.params)
+        jobs = list()
+        random_id = utils_misc.generate_random_id()
+        params = self.params.object_params(tag)
+        filename = storage.get_image_filename(params, self.data_dir)
+        img_node_name = "img_%s" % random_id
+        dev_node_name = "dev_%s" % random_id
+        params["target_size"] = self.get_target_image_size(tag)
+        image_create_options = {
+            "driver": params["image_type"],
+            "filename": filename,
+            "size": 0}
+        image_add_options = {
+            "driver": params["image_type"],
+            "filename": filename,
+            "node-name": img_node_name}
+        format_image_options = {
+            "driver": params["image_format"],
+            "size": params["target_size"],
+            "file": img_node_name}
+        add_device_options = {
+            "driver": params["image_format"],
+            "file": image_add_options["node-name"],
+            "node-name": dev_node_name}
+        if backing_info:
+            format_image_options.update(
+                {"backing-file": backing_info["backing-file"],
+                 "backing-fmt": backing_info["backing-fmt"]})
+            add_device_options.update({"backing": backing_info["backing"]})
 
+        jobs += [backup_utils.blockdev_create(self.vm, image_create_options)]
+        time.sleep(0.5)
+        try:
+            backup_utils.blockdev_add(self.vm, image_add_options)
+            time.sleep(0.5)
+            jobs += [backup_utils.blockdev_create(self.vm, format_image_options)]
+            time.sleep(0.5)
+            backup_utils.blockdev_add(self.vm, add_device_options)
+            job_dismiss = partial(job_utils.job_dismiss, self.vm)
+            map(job_dismiss, jobs)
+            time.sleep(0.5)
+            try:
+                backup_utils.get_block_node_by_name(self.vm, dev_node_name)
+            except IndexError:
+                raise self.test.fail(
+                    "Target device '%s' not exists" %
+                    dev_node_name)
+        finally:
+            self.trash_files.append(filename)
+        return dev_node_name
 
     def track_file1_with_bitmap2(self):
         """track file1 with bitmap2"""
-        action_items = [{"action": "disabled", "index": 2},
+        action_items = [{"action": "disable", "index": 2},
                         {"action": "add", "index": 3}]
         self._track_file_with_bitmap("file1", action_items)
 
@@ -135,9 +174,9 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
         """merged bitmap2 and bitmap3 into bitmap4"""
         source_bitmaps, target_bitmap = ["bitmap_2", "bitmap_3"], "bitmap_4"
         self.vm.monitor.block_dirty_bitmap_add(
-            self.device, target_bitmap, disbaled=True)
+            self.device, target_bitmap, disabled=True)
         block_dirty_bitmap.block_dirty_bitmap_merge(
-            self.device, source_bitmaps, target_bitmap)
+            self.vm, self.device, source_bitmaps, target_bitmap)
 
     def track_file3_with_bitmap5(self):
         """track file3 with bitmap5"""
@@ -148,18 +187,17 @@ class DifferentialBackupTest(live_backup_base.LiveBackup):
     def merge_bitmap5_to_bitmap4(self):
         source_bitmaps, target_bitmap = ["bitmap_5"], "bitmap_4"
         return block_dirty_bitmap.block_dirty_bitmap_merge(
-            self.device, source_bitmaps, target_bitmap)
+            self.vm, self.device, source_bitmaps, target_bitmap)
 
-    def do_incremental_backup_with_bitmap4(self, base_node, base_image):
+    def do_incremental_backup_with_bitmap4(self, base_node, tag):
         """Do incremental backup with bitmap4"""
-        fmt = self.params.object_params(self.tag).["image_format"]
-        backing = {"backing": base_node, "backing-file": base_image, "backing-fmt": fmt}
-        image = {"filename": self.params["incremental_backup_filename"],
-                 "driver": self.params["incremental_backup_format"],
-                 "size": self.get_target_image_size()}
-        target, image = job_utils.create_target_device(node, **backing, **image)
-        job_utils.incremental_backup(self.vm, self.device, target, "bitmap_4")
-        return node_name, image_file
+        node_info = backup_utils.get_block_node_by_name(self.vm, base_node)
+        backing = {
+            "backing": base_node,
+            "backing-file": node_info["image"]["filename"],
+            "backing-fmt": node_info["image"]["format"]}
+        node_name = self.create_target_block_device(backing, tag)
+        backup_utils.incremental_backup(self.vm, self.device, node_name, "bitmap_4")
 
     def clean(self):
         """Stop bitmaps and clear image files"""
@@ -193,7 +231,7 @@ def run(test, params, env):
         error_context.context("Initialize data disk", logging.info)
         backup_test.init_data_disk()
         error_context.context("Do full backup", logging.info)
-        node_name, image_file = backup_test.do_full_backup()
+        node_name = backup_test.do_full_backup("full")
         error_context.context("track file1 in bitmap2", logging.info)
         backup_test.track_file1_with_bitmap2()
         error_context.context("track file2 in bitmap3", logging.info)
@@ -225,6 +263,6 @@ def run(test, params, env):
         backup_test.merge_bitmap5_to_bitmap4()
         error_context.context(
             "Do incremental backup with bitmap4", logging.info)
-        backup_test.do_incremental_backup_with_bitmap4(node_name, image_file)
+        backup_test.do_incremental_backup_with_bitmap4(node_name, "inc")
     finally:
         backup_test.clean()
